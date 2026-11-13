@@ -34,7 +34,8 @@ import {ShareLockLib} from "./ShareLockLib.sol";
  *      6. 申购与赎回各有一个独立开关（{isDepositEnabled} / {isRedeemEnabled}），与暂停正交：
  *         暂停停全部，这两个开关各停一边。
  *      7. 可选的地址白名单：是否启用在 {initialize} 时一次性确定，之后不可更改。启用后
- *         申购、赎回、share 转账的相关地址都必须在 {isWhitelisted} 名单内。
+ *         申购、share 转账的相关地址都必须在 {isWhitelisted} 名单内，赎回不受名单限制；
+ *         申购后、执行前被移出名单的，{executeDeposit} 时即使 KYT 通过也只退款、不拉黑。
  *
  *      Share 锁定机制沿用 SyncVault：每个地址维护一条按 unlockTime 升序的链表，
  *      同一结算日窗口内的多笔认购合并进同一节点，跨窗口的认购各占一个节点，
@@ -727,6 +728,8 @@ contract MceVault is
      * @notice 按已上报的 KYT 结论执行申购：通过则铸份额，不通过则退款并把相关地址拉黑
      * @dev 一笔交易只处理一个单号。份额的锁定期从本次铸造时点起算。
      *      故意不加 {whenNotPaused}：暂停期间钱已经收在 Vault 里，必须留出退款/兑现的通道。
+     *      白名单启用时，KYT 通过但付款人或 receiver 已被移出名单的，只退款不拉黑；
+     *      {DepositExecuted} 的 passed 记为 false，申购单的 kytStatus 仍为 Passed，据此与 KYT 拒绝区分
      * @param depositId {DepositRequested} 里的申购单号
      */
     function executeDeposit(uint256 depositId) external nonReentrant onlyRole(CONTROLLER) {
@@ -752,14 +755,19 @@ contract MceVault is
         totalPendingDepositShares -= shares;
 
         bool passed = status == KytStatus.Passed;
+        if (!passed) {
+            _blacklist(receiver);
+            _blacklist(caller);
+        } else if (isWhitelistEnabled && !(_whitelist.contains(caller) && _whitelist.contains(receiver))) {
+            // 申购后被移出白名单：白名单管入口，不再给它铸份额，直接退款；不是 KYT 问题，不拉黑
+            passed = false;
+        }
         if (passed) {
             _mint(receiver, shares);
             totalFeesCollected += request.fee;
             emit Deposit(caller, receiver, assets, shares);
             emit CustomDeposit(caller, receiver, assets, shares, request.fee);
         } else {
-            _blacklist(receiver);
-            _blacklist(caller);
             IERC20(asset()).safeTransfer(caller, assets);
         }
 
@@ -1524,9 +1532,7 @@ contract MceVault is
         if (!isRedeemEnabled) {
             revert RedeemDisabled();
         }
-        _checkWhitelisted(caller);
-        _checkWhitelisted(receiver);
-        _checkWhitelisted(owner);
+        // 赎回不查白名单：白名单只管入口（申购、接收转账），已持有份额的随时可退出，到期代赎也不会因名单失败
 
         if (caller != owner) {
             _spendAllowance(owner, caller, shares);
@@ -1552,7 +1558,7 @@ contract MceVault is
      *      - mint：按 _normalize(now) + maturityPeriod 落入对应批次，同批次累加；锁定期 0 落在当天零点，铸出即解锁
      *      - burn：从最早解锁的批次开始 FIFO 扣减
      *      - transfer：FIFO 取出，unlockTime 原样转移给接收方；{isShareTransferable} 关闭时直接 revert，
-     *        白名单启用时转账双方都必须在名单内（铸造与销毁不在此校验，由申赎路径各自把关）
+     *        白名单启用时转账双方都必须在名单内（铸造与销毁不在此校验：申购路径自己把关，赎回不受名单限制）
      */
     function _update(address from, address to, uint256 value) internal override {
         if (from != address(0) && to != address(0)) {

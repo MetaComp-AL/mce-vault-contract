@@ -172,7 +172,7 @@ describe("MceVault", function () {
     expect(vault.interface.fragments.some((f) => f.name === "setWhitelistEnabled")).to.equal(false);
   });
 
-  it("白名单启用：申购、赎回、转账三条路径都要求地址在名单内", async function () {
+  it("白名单启用：申购、转账要求地址在名单内，赎回不受限制", async function () {
     const v = await deployVault(vaultFactory, [
       admin.address, await usdc.getAddress(), custodian.address, ONE_DAY, true, true, ...INIT_DEFAULTS, "WL", "WL",
     ]);
@@ -206,14 +206,38 @@ describe("MceVault", function () {
     await v.connect(alice).transfer(bob.address, USDC(100));
     expect(await v.balanceOf(bob.address)).to.equal(USDC(100));
 
-    // 赎回：把 alice 移出名单后就赎不了
+    // 赎回不受名单限制：移出名单后自己赎回、controller 到期代赎都照常
     await v.setWhitelisted(alice.address, false);
-    await expect(v.connect(alice).redeem(USDC(100), alice.address, alice.address))
-      .to.be.revertedWithCustomError(v, "NotWhitelisted")
-      .withArgs(alice.address);
-
-    await v.setWhitelisted(alice.address, true);
     await v.connect(alice).redeem(USDC(100), alice.address, alice.address);
+    await v.connect(controller).controllerRedeemUnlockedFor([alice.address], [USDC(100)]);
+    expect(await v.balanceOf(alice.address)).to.equal(USDC(700));
+    await v.setWhitelisted(alice.address, true);
+
+    // 申购后、执行前被移出名单：KYT 通过也只退款，不铸份额、不拉黑
+    await v.connect(controller).setDepositFee(10_000); // 1%
+    const before = await usdc.balanceOf(alice.address);
+    const supply = await v.totalSupply();
+    const feesBefore = await v.totalFeesCollected();
+    await v.connect(alice).deposit(USDC(1000), alice.address);
+    const depositId = await v.lastDepositId();
+    const { shares } = await v.pendingDeposits(depositId);
+    await v.connect(kyt).submitKytResult(depositId, true);
+    await v.setWhitelisted(alice.address, false);
+
+    await expect(v.connect(controller).executeDeposit(depositId))
+      .to.emit(v, "DepositExecuted")
+      .withArgs(depositId, alice.address, false, USDC(1000), shares, controller.address);
+    expect(await usdc.balanceOf(alice.address)).to.equal(before);
+    expect(await v.totalSupply()).to.equal(supply);
+    expect(await v.totalFeesCollected()).to.equal(feesBefore);
+    expect(await v.totalPendingDepositAssets()).to.equal(0);
+    expect(await v.depositBlacklist(alice.address)).to.equal(false);
+    // 申购单留着 KYT 通过的结论，下游据此与 KYT 拒绝区分
+    expect((await v.pendingDeposits(depositId)).kytStatus).to.equal(1);
+
+    // 加回名单后可以照常申购
+    await v.setWhitelisted(alice.address, true);
+    await dep(v, alice, USDC(1000));
   });
 
   it("申购开关 / 赎回开关：controller 可关可开，互不影响", async function () {
